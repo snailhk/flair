@@ -2,6 +2,7 @@ import os
 import re
 import logging
 from abc import abstractmethod
+from collections import Counter
 from pathlib import Path
 from typing import List, Union, Dict
 
@@ -29,6 +30,7 @@ from pytorch_pretrained_bert.modeling_transfo_xl import (
 )
 
 import flair
+from flair.data import Corpus
 from .nn import LockedDropout, WordDropout
 from .data import Dictionary, Token, Sentence
 from .file_utils import cached_path, open_inside_zip
@@ -112,7 +114,7 @@ class DocumentEmbeddings(Embeddings):
 class StackedEmbeddings(TokenEmbeddings):
     """A stack of embeddings, used if you need to combine several different embedding types."""
 
-    def __init__(self, embeddings: List[TokenEmbeddings], detach: bool = True):
+    def __init__(self, embeddings: List[TokenEmbeddings]):
         """The constructor takes a list of embeddings to be combined."""
         super().__init__()
 
@@ -122,9 +124,8 @@ class StackedEmbeddings(TokenEmbeddings):
         for i, embedding in enumerate(embeddings):
             self.add_module("list_embedding_{}".format(i), embedding)
 
-        self.detach: bool = detach
         self.name: str = "Stack"
-        self.static_embeddings: bool = True
+        self.static_embeddings: bool = False
 
         self.__embedding_type: str = embeddings[0].embedding_type
 
@@ -337,6 +338,93 @@ class WordEmbeddings(TokenEmbeddings):
 
     def __str__(self):
         return self.name
+
+
+class OneHotEmbeddings(TokenEmbeddings):
+    """Standard static word embeddings, such as GloVe or FastText."""
+
+    def __init__(
+        self,
+        corpus=Union[Corpus, List[Sentence]],
+        field: str = "text",
+        embedding_lenth: int = 300,
+        min_freq: int = 3,
+    ):
+
+        super().__init__()
+        self.name = "one-hot"
+        self.static_embeddings = False
+
+        all_tokens = corpus._get_all_tokens()
+        tokens_and_frequencies = Counter(all_tokens)
+        tokens_and_frequencies = tokens_and_frequencies.most_common()
+        # print(tokens_and_frequencies)
+        # print(len(tokens_and_frequencies))
+        # print(len(all_tokens))
+        #
+        # cutoff = int(len(tokens_and_frequencies) * 0.9)
+        # print(cutoff)
+        # print(tokens_and_frequencies[cutoff])
+        #
+        # asd
+
+        # max_tokens = 500
+        self.__embedding_length = embedding_lenth
+
+        tokens = []
+        for token, freq in tokens_and_frequencies:
+            if freq < min_freq:
+                break
+            tokens.append(token)
+
+        self.vocab_dictionary: Dictionary = Dictionary()
+        for token in tokens:
+            self.vocab_dictionary.add_item(token)
+
+        # print(self.vocab_dictionary.item2idx)
+        print(len(self.vocab_dictionary))
+
+        # model architecture
+        self.embedding_layer = torch.nn.Embedding(
+            len(self.vocab_dictionary), self.__embedding_length
+        )
+        torch.nn.init.xavier_uniform_(self.embedding_layer.weight)
+
+    @property
+    def embedding_length(self) -> int:
+        return self.__embedding_length
+
+    def _add_embeddings_internal(self, sentences: List[Sentence]) -> List[Sentence]:
+
+        one_hot_sentences = []
+        for i, sentence in enumerate(sentences):
+            context_idxs = [
+                self.vocab_dictionary.get_idx_for_item(t.text) for t in sentence.tokens
+            ]
+
+            one_hot_sentences.extend(context_idxs)
+
+        one_hot_sentences = torch.tensor(one_hot_sentences, dtype=torch.long).to(
+            flair.device
+        )
+
+        embedded = self.embedding_layer.forward(one_hot_sentences)
+
+        index = 0
+        for sentence in sentences:
+            for token in sentence:
+                embedding = embedded[index]
+                token.set_embedding(self.name, embedding)
+                index += 1
+
+        return sentences
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def embedding_length(self) -> int:
+        return self.__embedding_length
 
 
 class BPEmbSerializable(BPEmb):
@@ -1814,7 +1902,12 @@ class DocumentMeanEmbeddings(DocumentEmbeddings):
 
 
 class DocumentPoolEmbeddings(DocumentEmbeddings):
-    def __init__(self, embeddings: List[TokenEmbeddings], mode: str = "mean"):
+    def __init__(
+        self,
+        embeddings: List[TokenEmbeddings],
+        mode: str = "mean",
+        reproject_words: bool = True,
+    ):
         """The constructor takes a list of embeddings to be combined.
         :param embeddings: a list of token embeddings
         :param mode: a string which can any value from ['mean', 'max', 'min']
@@ -1822,6 +1915,19 @@ class DocumentPoolEmbeddings(DocumentEmbeddings):
         super().__init__()
 
         self.embeddings: StackedEmbeddings = StackedEmbeddings(embeddings=embeddings)
+
+        # reprojection on top of embedding layer
+        self.reproject_words = reproject_words
+        if self.reproject_words:
+            self.reprojection_map = torch.nn.Linear(
+                self.embeddings.embedding_length, self.embeddings.embedding_length
+            )
+            self.reprojection_relu = torch.nn.ReLU(self.embeddings.embedding_length)
+            self.reprojection_map_2 = torch.nn.Linear(
+                self.embeddings.embedding_length, self.embeddings.embedding_length
+            )
+            torch.nn.init.xavier_uniform_(self.reprojection_map.weight)
+            torch.nn.init.xavier_uniform_(self.reprojection_map_2.weight)
 
         self.__embedding_length: int = self.embeddings.embedding_length
 
@@ -1846,33 +1952,30 @@ class DocumentPoolEmbeddings(DocumentEmbeddings):
         """Add embeddings to every sentence in the given list of sentences. If embeddings are already added, updates
         only if embeddings are non-static."""
 
-        everything_embedded: bool = True
-
         # if only one sentence is passed, convert to list of sentence
         if isinstance(sentences, Sentence):
             sentences = [sentences]
 
+        self.embeddings.embed(sentences)
+
         for sentence in sentences:
-            if self.name not in sentence._embeddings.keys():
-                everything_embedded = False
+            word_embeddings = []
+            for token in sentence.tokens:
+                word_embeddings.append(token.get_embedding().unsqueeze(0))
 
-        if not everything_embedded:
+            word_embeddings = torch.cat(word_embeddings, dim=0).to(flair.device)
 
-            self.embeddings.embed(sentences)
+            if self.reproject_words:
+                word_embeddings = self.reprojection_map(word_embeddings)
+                word_embeddings = self.reprojection_relu(word_embeddings)
+                word_embeddings = self.reprojection_map_2(word_embeddings)
 
-            for sentence in sentences:
-                word_embeddings = []
-                for token in sentence.tokens:
-                    word_embeddings.append(token.get_embedding().unsqueeze(0))
+            if self.mode == "mean":
+                pooled_embedding = self.pool_op(word_embeddings, 0)
+            else:
+                pooled_embedding, _ = self.pool_op(word_embeddings, 0)
 
-                word_embeddings = torch.cat(word_embeddings, dim=0).to(flair.device)
-
-                if self.mode == "mean":
-                    pooled_embedding = self.pool_op(word_embeddings, 0)
-                else:
-                    pooled_embedding, _ = self.pool_op(word_embeddings, 0)
-
-                sentence.set_embedding(self.name, pooled_embedding)
+            sentence.set_embedding(self.name, pooled_embedding)
 
     def _add_embeddings_internal(self, sentences: List[Sentence]):
         pass
@@ -1927,10 +2030,19 @@ class DocumentRNNEmbeddings(DocumentEmbeddings):
         if self.reproject_words and reproject_words_dimension is not None:
             self.embeddings_dimension = reproject_words_dimension
 
-        # bidirectional RNN on top of embedding layer
-        self.word_reprojection_map = torch.nn.Linear(
-            self.length_of_all_token_embeddings, self.embeddings_dimension
-        )
+        self.reproject_words = reproject_words
+        if self.reproject_words:
+            self.reprojection_map = torch.nn.Linear(
+                self.embeddings.embedding_length, self.embeddings.embedding_length
+            )
+            self.reprojection_relu = torch.nn.ReLU(self.embeddings.embedding_length)
+            self.reprojection_map_2 = torch.nn.Linear(
+                self.embeddings.embedding_length, self.embeddings.embedding_length
+            )
+
+            torch.nn.init.xavier_uniform_(self.reprojection_map.weight)
+            torch.nn.init.xavier_uniform_(self.reprojection_map_2.weight)
+
         self.rnn = torch.nn.RNNBase(
             rnn_type,
             self.embeddings_dimension,
@@ -1950,8 +2062,6 @@ class DocumentRNNEmbeddings(DocumentEmbeddings):
         self.use_word_dropout: bool = word_dropout > 0.0
         if self.use_word_dropout:
             self.word_dropout = WordDropout(word_dropout)
-
-        torch.nn.init.xavier_uniform_(self.word_reprojection_map.weight)
 
         self.to(flair.device)
 
@@ -2016,7 +2126,9 @@ class DocumentRNNEmbeddings(DocumentEmbeddings):
             sentence_tensor = self.word_dropout(sentence_tensor)
 
         if self.reproject_words:
-            sentence_tensor = self.word_reprojection_map(sentence_tensor)
+            sentence_tensor = self.reprojection_map(sentence_tensor)
+            sentence_tensor = self.reprojection_relu(sentence_tensor)
+            sentence_tensor = self.reprojection_map_2(sentence_tensor)
 
         sentence_tensor = self.dropout(sentence_tensor)
 

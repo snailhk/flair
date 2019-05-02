@@ -48,7 +48,7 @@ class TextClassifier(flair.nn.Model):
         self._init_weights()
 
         if multi_label:
-            self.loss_function = nn.BCELoss()
+            self.loss_function = nn.MultiLabelSoftMarginLoss()
         else:
             self.loss_function = nn.CrossEntropyLoss()
 
@@ -264,7 +264,9 @@ class TextClassifier(flair.nn.Model):
 
         return self._calculate_single_label_loss(scores, sentences)
 
-    def _obtain_labels(self, scores: List[List[float]]) -> List[List[Label]]:
+    def _obtain_labels(
+        self, scores: List[List[float]], predict_prob: bool = True
+    ) -> List[List[Label]]:
         """
         Predicts the labels of sentences.
         :param scores: the prediction scores from the model
@@ -273,6 +275,9 @@ class TextClassifier(flair.nn.Model):
 
         if self.multi_label:
             return [self._get_multi_label(s) for s in scores]
+
+        elif predict_prob:
+            return [self._predict_label_probab(s) for s in scores]
 
         return [self._get_single_label(s) for s in scores]
 
@@ -296,13 +301,23 @@ class TextClassifier(flair.nn.Model):
 
         return [Label(label, conf.item())]
 
+    def _predict_label_probab(self, label_scores) -> List[Label]:
+        softmax = torch.nn.functional.softmax(label_scores, dim=0)
+        label_probabs = []
+        for idx, conf in enumerate(softmax):
+            label = self.label_dictionary.get_item_for_index(idx)
+            label_probabs.append(Label(label, conf.item()))
+        return label_probabs
+
     def _calculate_multi_label_loss(
         self, label_scores, sentences: List[Sentence]
     ) -> float:
-        sigmoid = nn.Sigmoid()
-        return self.loss_function(
-            sigmoid(label_scores), self._labels_to_one_hot(sentences)
-        )
+        return self.loss_function(label_scores, self._labels_to_one_hot(sentences))
+
+        # sigmoid = nn.Sigmoid()
+        # return self.loss_function(
+        #     sigmoid(label_scores), self._labels_to_one_hot(sentences)
+        # )
 
     def _calculate_single_label_loss(
         self, label_scores, sentences: List[Sentence]
